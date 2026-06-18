@@ -1,0 +1,1815 @@
+import numpy as np
+import gymnasium as gym
+from gymnasium import spaces
+import time
+import os
+import sys
+
+try:
+    from scipy.optimize import minimize
+except Exception:
+    minimize = None
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
+from env.reward_logic import (
+    compute_dose_metrics,
+    compute_reward,
+    compute_hrctv_coverage,
+    deposit_line_superposition,
+    add_far_field_tail,
+    prepare_structure_coords,
+    _line_dose_numba_single,
+    _blend_dose_numba_single,
+    voxels_to_mm,
+    compute_path_tangents_mm,
+    MISS_PENALTY_WEIGHT,
+    LABELS,
+    AIR_KERMA_STRENGTH_U,
+    D90_MAX_CGY,
+    D90_TARGET_CGY,
+    D90_TOL_CGY,
+    TG43_BLEND_CENTER_DEG,
+    TG43_BLEND_WIDTH_DEG,
+    TG43_FLIP_ANISOTROPY,
+    TG43_CABLE_ANISO_MIN,
+    TG43_CABLE_ANISO_THETA_DEG,
+)
+from env import tg43
+from env.dose_cache import build_path_kernel_cache, scatter_add_dose
+
+HRCTV_LABEL = 1
+
+
+class BrachyRL_TG43(gym.Env):
+
+    metadata = {"render_modes": ["human", "array"]}
+
+    def __init__(self, structure_mask, max_needles=10,
+                 voxel_size_mm=2.0, tg43_kernel=None,
+                 anatomical_library=None,
+                 base_dose_map=None,
+                 voxel_spacing_mm=None,
+                 min_path_separation_mm=None,
+                 avoid_paths=None,
+                 overlap_penalty=5.0,
+                 kernel_radius_mm=100.0,
+                 max_dwell_time=30.0,
+                 delta_max_seconds=20.0,
+                 log_steps=False,
+                 max_episode_steps=None,
+                 fixed_max_path_points=None,
+                 label_mapping=None,
+                 dose_model="blend",
+                 air_kerma_strength=AIR_KERMA_STRENGTH_U,
+                 blend_center_deg=TG43_BLEND_CENTER_DEG,
+                 blend_width_deg=TG43_BLEND_WIDTH_DEG,
+                 flip_anisotropy=TG43_FLIP_ANISOTROPY,
+                 cable_aniso_min=TG43_CABLE_ANISO_MIN,
+                 cable_aniso_theta_deg=TG43_CABLE_ANISO_THETA_DEG,
+                 slice_offsets=(-1, 0, 1),
+                 include_mask_names=None,
+                 tandem_opt_scale_min=0.0,
+                 tandem_opt_scale_max=1.5,
+                 tandem_opt_scale_steps=7,
+                 tandem_paths=None,
+                 ovoid_paths=None,
+                 tandem_path_idx=None,
+                 tandem_dwell_init=None,
+                 ovoid_dwell_init=None,
+                 tandem_opt_min_dwell=0.0,
+                 tandem_opt_max_dwell=60.0,
+                 tandem_opt_max_iter=40,
+                 needle_target=None,
+                 min_needles_for_stop=0,
+                 needle_insert_bonus=0.0,
+                 stop_low_needles_penalty=15.0,
+                 enable_tandem_opt: bool = True):
+
+        super().__init__()
+
+        self.structure_mask = structure_mask
+        self.max_needles = max_needles
+        self.voxel_size_mm = voxel_size_mm
+        self.log_steps = bool(log_steps)
+        self.label_mapping = label_mapping.copy() if label_mapping is not None else LABELS.copy()
+        self.dose_structures = ["HRCTV", "Rectum", "Bladder", "Sigmoid", "Bowel", "Vagina"]
+        self.dose_model = str(dose_model).lower()
+        if self.dose_model not in {"line", "blend", "kernel"}:
+            raise ValueError("dose_model must be 'line', 'blend', or 'kernel'")
+        self.air_kerma_strength = float(air_kerma_strength)
+        self.tg43_blend_center_deg = float(blend_center_deg)
+        self.tg43_blend_width_deg = float(blend_width_deg)
+        self.tg43_flip_anisotropy = bool(flip_anisotropy)
+        self.tg43_cable_aniso_min = None if cable_aniso_min is None else float(cable_aniso_min)
+        self.tg43_cable_aniso_theta_deg = float(cable_aniso_theta_deg)
+        self.enable_tandem_opt = bool(enable_tandem_opt)
+        if needle_target is None:
+            needle_target = max(1, int(round(0.4 * self.max_needles)))
+        self.needle_target = max(0, min(int(needle_target), int(self.max_needles)))
+        if min_needles_for_stop is None:
+            min_needles_for_stop = max(1, int(round(0.3 * self.max_needles)))
+        self.min_needles_for_stop = max(0, min(int(min_needles_for_stop), int(self.max_needles)))
+        self.needle_insert_bonus = float(needle_insert_bonus)
+        self.stop_low_needles_penalty = float(stop_low_needles_penalty)
+
+        # -------------------------------------------------------
+        # ANATOMICAL NEEDLE LIBRARY (REQUIRED)
+        # -------------------------------------------------------
+        if anatomical_library is None or len(anatomical_library) == 0:
+            raise ValueError("Environment requires anatomical_library (no fallback mode).")
+
+        # Ensure paths are in (z,y,x)
+        for needle in anatomical_library:
+            path = np.array(needle["path_vox"])
+            if path.shape[1] == 3:
+                # If path is (z,y,x) already, keep as is.
+                # If it came in reversed (x,y,z), user would've noticed mismatched organs already.
+                pass
+            needle["path_vox"] = [tuple(p) for p in path]
+
+        self.anatomical_library = anatomical_library
+        self.n_paths = len(anatomical_library)
+        self.max_path_points = max(len(p["path_vox"]) for p in anatomical_library)
+        if fixed_max_path_points is not None:
+            self.max_path_points = max(self.max_path_points, int(fixed_max_path_points))
+        self.max_dwell_time = max_dwell_time
+        self.delta_max_seconds = float(delta_max_seconds)
+
+        hrctv_coords = np.argwhere(self.structure_mask == HRCTV_LABEL)
+        if hrctv_coords.size == 0:
+            raise ValueError("HRCTV mask empty.")
+        self.hrctv_centroid = hrctv_coords.mean(axis=0)
+        self.slice_size = 32
+        self.slice_scale = 700.0
+        self.slice_offsets = np.array(slice_offsets, dtype=int)
+        if self.slice_offsets.size == 0:
+            raise ValueError("slice_offsets must contain at least one offset.")
+        if include_mask_names is None:
+            include_mask_names = ["HRCTV", "Rectum", "Bladder", "Sigmoid", "Bowel", "Vagina"]
+        seen = set()
+        self.obs_mask_names = []
+        self.obs_mask_labels = []
+        self.obs_mask_volumes = []
+        for name in include_mask_names:
+            if name in seen:
+                continue
+            seen.add(name)
+            label = self.label_mapping.get(name)
+            if label is None:
+                continue
+            self.obs_mask_names.append(name)
+            self.obs_mask_labels.append(label)
+            self.obs_mask_volumes.append(self.structure_mask == label)
+        self.num_mask_channels = len(self.obs_mask_labels)
+
+        # -------------------------------------------------------
+        # TG43
+        # -------------------------------------------------------
+        if voxel_spacing_mm is None:
+            voxel_spacing_mm = (voxel_size_mm, voxel_size_mm, voxel_size_mm)
+        self.voxel_spacing_mm = np.array(voxel_spacing_mm, dtype=np.float32)
+
+        self.structure_indices, self.structure_coords_mm = prepare_structure_coords(
+            self.structure_mask,
+            self.label_mapping,
+            self.voxel_spacing_mm,
+            include_structures=self.dose_structures,
+        )
+        self.structure_labels = list(self.structure_indices.keys())
+        self.structure_flat_indices = {}
+        shape = self.structure_mask.shape
+        for label, idx in self.structure_indices.items():
+            if idx is None or len(idx) == 0:
+                continue
+            idx = np.asarray(idx, dtype=np.int64)
+            flat = np.ravel_multi_index(
+                (idx[:, 0], idx[:, 1], idx[:, 2]),
+                dims=shape,
+                mode="clip",
+            )
+            self.structure_flat_indices[int(label)] = flat
+
+        self.kernel_radius_mm = float(kernel_radius_mm)
+        self.tg43_kernel = None
+        if self.dose_model == "kernel":
+            self.tg43_kernel = tg43_kernel if tg43_kernel is not None else self.build_tg43_kernel(self.kernel_radius_mm)
+
+        if base_dose_map is not None and base_dose_map.shape != self.structure_mask.shape:
+            raise ValueError("base_dose_map shape must match structure_mask")
+        self.base_dose_map = None if base_dose_map is None else base_dose_map.astype(np.float32)
+        self.base_dose_scale = 1.0
+        self.tandem_opt_scale_min = float(tandem_opt_scale_min)
+        self.tandem_opt_scale_max = float(tandem_opt_scale_max)
+        if self.tandem_opt_scale_max < self.tandem_opt_scale_min:
+            self.tandem_opt_scale_min, self.tandem_opt_scale_max = (
+                self.tandem_opt_scale_max,
+                self.tandem_opt_scale_min,
+            )
+        self.tandem_opt_scale_steps = max(1, int(tandem_opt_scale_steps))
+        self.tandem_opt_scales = np.linspace(
+            self.tandem_opt_scale_min,
+            self.tandem_opt_scale_max,
+            self.tandem_opt_scale_steps,
+            dtype=np.float32,
+        )
+        self.tandem_opt_min_dwell = float(tandem_opt_min_dwell)
+        self.tandem_opt_max_dwell = float(tandem_opt_max_dwell)
+        if self.tandem_opt_max_dwell < self.tandem_opt_min_dwell:
+            self.tandem_opt_min_dwell, self.tandem_opt_max_dwell = (
+                self.tandem_opt_max_dwell,
+                self.tandem_opt_min_dwell,
+            )
+        self.tandem_opt_max_iter = max(1, int(tandem_opt_max_iter))
+
+        self.tandem_paths = []
+        if tandem_paths:
+            for path in tandem_paths:
+                if isinstance(path, dict) and "path_vox" in path:
+                    path = path["path_vox"]
+                self.tandem_paths.append([tuple(p) for p in np.asarray(path)])
+        self.ovoid_paths = []
+        if ovoid_paths:
+            for path in ovoid_paths:
+                if isinstance(path, dict) and "path_vox" in path:
+                    path = path["path_vox"]
+                self.ovoid_paths.append([tuple(p) for p in np.asarray(path)])
+        if tandem_path_idx is not None:
+            self.tandem_path_idx = int(tandem_path_idx)
+        elif self.tandem_paths:
+            self.tandem_path_idx = 0
+        else:
+            self.tandem_path_idx = None
+        self.tandem_dwell_times = None
+        self.ovoid_dwell_times = None
+        if tandem_dwell_init is not None:
+            self.tandem_dwell_times = np.asarray(tandem_dwell_init, dtype=np.float32).copy()
+        if ovoid_dwell_init is not None:
+            ovoid_init = []
+            for dwell in ovoid_dwell_init:
+                ovoid_init.append(np.asarray(dwell, dtype=np.float32).copy())
+            self.ovoid_dwell_times = ovoid_init
+
+        hard_min_sep_mm = 5.0
+        if min_path_separation_mm is None:
+            min_path_separation_mm = hard_min_sep_mm
+        self.min_path_separation_mm = max(hard_min_sep_mm, float(min_path_separation_mm))
+        self.overlap_penalty = float(overlap_penalty)
+        self.avoid_paths = []
+        if avoid_paths:
+            for path in avoid_paths:
+                if isinstance(path, dict) and "path_vox" in path:
+                    path = path["path_vox"]
+                arr = np.asarray(path, dtype=float)
+                if arr.ndim == 2 and arr.shape[1] == 3:
+                    self.avoid_paths.append(arr)
+        default_steps = max(1, int(max_needles * self.max_path_points))
+        self.max_episode_steps = int(max_episode_steps) if max_episode_steps is not None else default_steps
+        self.episode_steps = 0
+
+        # Precompute per-path TG-43 kernels for fast updates
+        if self.dose_model == "kernel":
+            self.path_kernel_cache = build_path_kernel_cache(
+                [needle["path_vox"] for needle in self.anatomical_library],
+                self.structure_mask.shape,
+                self.tg43_kernel,
+            )
+        else:
+            self.path_kernel_cache = None
+
+        # -------------------------------------------------------
+        # State
+        # -------------------------------------------------------
+        self.needle_positions = []    # list of final needle tips (z,y,x)
+        self.needle_paths = []        # list of lists of (z,y,x)
+        self.needle_path_indices = [] # indices into anatomical_library
+        self.needle_dwells = []       # per-needle dwell vectors
+        self.needle_min_dwell_idx = [] # per-needle min dwell index
+        self.needle_max_dwell_idx = [] # per-needle max dwell index
+        self.proximity_penalties = [] # per-needle spacing penalties
+        self.dose_map = np.zeros_like(self.structure_mask, dtype=np.float32)
+        self.last_dwell_times = np.zeros(self.max_path_points, dtype=np.float32)
+        self.baseline_d90 = 0.0
+        self.baseline_d98 = 0.0
+        self.baseline_oar_doses = None
+        self.last_hrctv_d90 = 0.0
+        self.d90_target = float(D90_TARGET_CGY)
+        self.d90_tol = float(D90_TOL_CGY)
+        # Boost dwell updates when under-dosed, tighten when in/over band.
+        self.delta_scale_under = 2.0
+        self.delta_scale_inband = 0.5
+        self.delta_scale_over = 0.5
+        self.penalty = 0.0
+
+        # -------------------------------------------------------
+        # ACTION/OBSERVATION SPACE SUPPORT
+        # -------------------------------------------------------
+        self.dwell_ds_stride = 3
+        self.dwell_flat_len = self.max_needles * self.max_path_points
+        self.dwell_ds_len = int(np.ceil(self.dwell_flat_len / self.dwell_ds_stride)) if self.dwell_flat_len else 0
+
+        # -------------------------------------------------------
+        # ACTION SPACE: continuous vector (selector + per-needle dwell deltas)
+        # Policy emits values in [-1, 1]
+        # action[0]: path selector (last index is STOP, second-last triggers tandem/ovoid optimize)
+        # action[1:]: flattened per-dwell signed deltas for all needle slots
+        self.action_space = spaces.Box(
+            low=-1.0,
+            high=1.0,
+            shape=(1 + self.dwell_flat_len,),
+            dtype=np.float32,
+        )
+
+        # -------------------------------------------------------
+        # OBSERVATION SPACE
+        # scalars: HRCTV/OAR doses + capacity fractions
+        # slices: 3 planes of dose around HRCTV centroid (axial/sagittal/coronal)
+        # -------------------------------------------------------
+        scalar_low = np.zeros(12 + 3 + self.dwell_ds_len, dtype=np.float32)
+        scalar_high = np.array(
+            [2000, 2000, 2000, 2000, 2000, 2000, 1, 1, 1, 1, 2000, 2000]
+            + [
+                float(self.max_dwell_time),
+                float(self.max_dwell_time),
+                float(self.max_dwell_time * max(self.dwell_flat_len, 1)),
+            ]
+            + [float(self.max_dwell_time)] * self.dwell_ds_len,
+            dtype=np.float32,
+        )
+        self.slice_dim = (
+            len(self.slice_offsets) * 3 * (1 + self.num_mask_channels) * self.slice_size * self.slice_size
+        )
+        hist_dim = 5
+        slice_low = np.zeros(self.slice_dim, dtype=np.float32)
+        slice_high = np.full(self.slice_dim, 5.0, dtype=np.float32)
+        hist_low = np.zeros(hist_dim, dtype=np.float32)
+        hist_high = np.ones(hist_dim, dtype=np.float32)
+        obs_low = np.concatenate([scalar_low, hist_low, slice_low])
+        obs_high = np.concatenate([scalar_high, hist_high, slice_high])
+        self.observation_space = spaces.Box(low=obs_low, high=obs_high, dtype=np.float32)
+
+    def _path_min_distance_mm(self, path_a, path_b):
+        pa = np.asarray(path_a, dtype=float)
+        pb = np.asarray(path_b, dtype=float)
+        if pa.size == 0 or pb.size == 0:
+            return np.inf
+        diffs = pa[:, None, :] - pb[None, :, :]
+        diffs_mm = diffs * self.voxel_spacing_mm[None, None, :]
+        d2 = np.sum(diffs_mm**2, axis=-1)
+        return float(np.sqrt(d2.min()))
+
+    def _cap_hrctv_d90(self, value: float) -> float:
+        return min(float(value), float(D90_MAX_CGY))
+
+    def _update_best_hrctv_d90(self, value: float) -> None:
+        self.best_hrctv_d90 = max(self.best_hrctv_d90, self._cap_hrctv_d90(value))
+
+    def _violates_min_separation(self, candidate_path, other_paths):
+        if self.min_path_separation_mm is None:
+            return False
+        for other in other_paths:
+            dist_mm = self._path_min_distance_mm(candidate_path, other)
+            if dist_mm < self.min_path_separation_mm:
+                return True
+        return False
+
+    def _entry_distance_mm(self, path_a, path_b):
+        pa = np.asarray(path_a, dtype=float)
+        pb = np.asarray(path_b, dtype=float)
+        if pa.size == 0 or pb.size == 0:
+            return np.inf
+        diff_mm = (pa[0] - pb[0]) * self.voxel_spacing_mm
+        return float(np.linalg.norm(diff_mm))
+
+    def _needle_hit_fraction(self, path_vox, min_dwell_idx=0, max_dwell_idx=None):
+        if not path_vox:
+            return 0.0
+        path_len = len(path_vox)
+        if path_len == 0:
+            return 0.0
+        min_idx = max(0, min(int(min_dwell_idx or 0), path_len - 1))
+        if max_dwell_idx is None:
+            max_idx = path_len - 1
+        else:
+            max_idx = max(min_idx, min(int(max_dwell_idx), path_len - 1))
+        segment = np.asarray(path_vox[min_idx:max_idx + 1], dtype=np.int64)
+        if segment.size == 0:
+            return 0.0
+        z = np.clip(segment[:, 0], 0, self.structure_mask.shape[0] - 1)
+        y = np.clip(segment[:, 1], 0, self.structure_mask.shape[1] - 1)
+        x = np.clip(segment[:, 2], 0, self.structure_mask.shape[2] - 1)
+        hits = self.structure_mask[z, y, x] == HRCTV_LABEL
+        return float(np.mean(hits)) if hits.size else 0.0
+
+    def _low_needle_penalty(self, needle_count):
+        if self.min_needles_for_stop <= 0:
+            return 0.0
+        shortfall = max(0, int(self.min_needles_for_stop) - int(needle_count))
+        if shortfall <= 0:
+            return 0.0
+        return float(self.stop_low_needles_penalty) * float(shortfall)
+
+    def _total_needle_dwell_time(self) -> float:
+        if not self.needle_dwells:
+            return 0.0
+        return float(sum(float(np.sum(vec)) for vec in self.needle_dwells))
+
+    def _is_valid_new_path(self, candidate_path, min_entry_mm, min_dwell_idx=0, max_dwell_idx=None):
+        if len(candidate_path) == 0:
+            return False, "empty_path"
+        if min_dwell_idx is not None and min_dwell_idx >= len(candidate_path):
+            return False, "min_dwell_idx"
+        if max_dwell_idx is not None and max_dwell_idx < 0:
+            return False, "max_dwell_idx"
+        if max_dwell_idx is not None and max_dwell_idx >= len(candidate_path):
+            return False, "max_dwell_idx"
+        if max_dwell_idx is not None and min_dwell_idx is not None:
+            if max_dwell_idx < min_dwell_idx:
+                return False, "dwell_window"
+        entry_point = np.array(candidate_path[0], dtype=float)
+        for existing_path in self.needle_paths:
+            existing_entry = np.array(existing_path[0], dtype=float)
+            diff_mm = (entry_point - existing_entry) * self.voxel_spacing_mm
+            if np.linalg.norm(diff_mm) < min_entry_mm:
+                return False, "entry_spacing"
+        if self._violates_min_separation(candidate_path, self.needle_paths):
+            return False, "min_path"
+        if self.avoid_paths and self._violates_min_separation(candidate_path, self.avoid_paths):
+            return False, "avoid_path"
+        return True, ""
+
+    def _find_valid_alternative_path(self, source_path, min_entry_mm, skip_index=None):
+        best_idx = None
+        best_path = None
+        best_dist = np.inf
+        for idx, needle in enumerate(self.anatomical_library):
+            if skip_index is not None and idx == skip_index:
+                continue
+            if idx in self.needle_path_indices:
+                continue
+            candidate_path = needle.get("path_vox", [])
+            candidate_min_idx = int(needle.get("min_dwell_idx", 0) or 0)
+            candidate_max_idx = needle.get("max_dwell_idx", None)
+            if candidate_max_idx is not None:
+                candidate_max_idx = int(candidate_max_idx)
+            valid, _reason = self._is_valid_new_path(
+                candidate_path, min_entry_mm, candidate_min_idx, candidate_max_idx
+            )
+            if not valid:
+                continue
+            dist_mm = self._entry_distance_mm(source_path, candidate_path)
+            if dist_mm < best_dist:
+                best_dist = dist_mm
+                best_idx = idx
+                best_path = candidate_path
+        if best_idx is None:
+            return None
+        return best_idx, best_path
+
+    def _final_spacing_penalty(self):
+        if self.min_path_separation_mm is None or len(self.needle_paths) < 2:
+            return 0.0
+        total = 0.0
+        for i in range(len(self.needle_paths)):
+            for j in range(i + 1, len(self.needle_paths)):
+                dist_mm = self._path_min_distance_mm(self.needle_paths[i], self.needle_paths[j])
+                if dist_mm < self.min_path_separation_mm:
+                    overlap_ratio = 1.0 - dist_mm / max(self.min_path_separation_mm, 1e-6)
+                    total += self.overlap_penalty * overlap_ratio
+        return total
+
+    def _get_selected_tandem_path(self):
+        if not self.tandem_paths:
+            return []
+        idx = 0 if self.tandem_path_idx is None else int(self.tandem_path_idx)
+        idx = int(np.clip(idx, 0, len(self.tandem_paths) - 1))
+        return self.tandem_paths[idx]
+
+    def _compute_tandem_ovoid_dose(self, tandem_dwells, ovoid_dwells):
+        dose_map = np.zeros_like(self.structure_mask, dtype=np.float32)
+
+        def _align_weights(weights, length):
+            w = np.asarray(weights, dtype=np.float32).reshape(-1)
+            if w.size < length:
+                w = np.pad(w, (0, length - w.size))
+            elif w.size > length:
+                w = w[:length]
+            return w
+
+        tandem_path = self._get_selected_tandem_path()
+        if tandem_path:
+            path_vox = np.asarray(tandem_path, dtype=np.float32)
+            weights = _align_weights(tandem_dwells, path_vox.shape[0])
+            dwell_mm = voxels_to_mm(path_vox, self.voxel_spacing_mm)
+            tangents = compute_path_tangents_mm(dwell_mm)
+            dose_map += deposit_line_superposition(
+                path_vox,
+                weights,
+                self.structure_mask,
+                self.voxel_spacing_mm,
+                self.label_mapping,
+                include_structures=self.dose_structures,
+                structure_indices=self.structure_indices,
+                precomputed_coords=self.structure_coords_mm,
+                path_tangents=tangents,
+                dose_model=self.dose_model if self.dose_model != "kernel" else "line",
+                blend_center_deg=self.tg43_blend_center_deg,
+                blend_width_deg=self.tg43_blend_width_deg,
+                flip_anisotropy=self.tg43_flip_anisotropy,
+                cable_aniso_min=self.tg43_cable_aniso_min,
+                cable_aniso_theta_deg=self.tg43_cable_aniso_theta_deg,
+            )
+
+        for path, weights in zip(self.ovoid_paths, ovoid_dwells or []):
+            if not path:
+                continue
+            path_vox = np.asarray(path, dtype=np.float32)
+            w = _align_weights(weights, path_vox.shape[0])
+            dwell_mm = voxels_to_mm(path_vox, self.voxel_spacing_mm)
+            tangents = compute_path_tangents_mm(dwell_mm)
+            dose_map += deposit_line_superposition(
+                path_vox,
+                w,
+                self.structure_mask,
+                self.voxel_spacing_mm,
+                self.label_mapping,
+                include_structures=self.dose_structures,
+                structure_indices=self.structure_indices,
+                precomputed_coords=self.structure_coords_mm,
+                path_tangents=tangents,
+                dose_model=self.dose_model if self.dose_model != "kernel" else "line",
+                blend_center_deg=self.tg43_blend_center_deg,
+                blend_width_deg=self.tg43_blend_width_deg,
+                flip_anisotropy=self.tg43_flip_anisotropy,
+                cable_aniso_min=self.tg43_cable_aniso_min,
+                cable_aniso_theta_deg=self.tg43_cable_aniso_theta_deg,
+            )
+
+        return dose_map
+
+    def _sample_base_points(self, max_points_per_label=2000, rng=None):
+        if self.base_dose_map is None:
+            return None, None
+        rng = np.random.default_rng(0) if rng is None else rng
+        coords_list = []
+        values_list = []
+        for label, idx in self.structure_indices.items():
+            vox = idx
+            if vox.size == 0:
+                continue
+            if vox.shape[0] > max_points_per_label:
+                sel = rng.choice(vox.shape[0], size=max_points_per_label, replace=False)
+                vox = vox[sel]
+                coords_mm = self.structure_coords_mm[label][sel]
+            else:
+                coords_mm = self.structure_coords_mm[label]
+            vals = self.base_dose_map[vox[:, 0], vox[:, 1], vox[:, 2]].astype(np.float32)
+            coords_list.append(coords_mm.astype(np.float32))
+            values_list.append(vals)
+        if not coords_list:
+            return None, None
+        coords_mm = np.concatenate(coords_list, axis=0)
+        values = np.concatenate(values_list, axis=0)
+        return coords_mm, values
+
+    def _infer_initial_dwells_from_base(self, tandem_path, ovoid_paths):
+        if self.base_dose_map is None:
+            return None
+        total_dwells = len(tandem_path) + sum(len(p) for p in ovoid_paths)
+        if total_dwells == 0:
+            return None
+
+        coords_mm, base_vals = self._sample_base_points()
+        if coords_mm is None or base_vals is None or coords_mm.size == 0:
+            return None
+
+        A = np.zeros((coords_mm.shape[0], total_dwells), dtype=np.float32)
+        col = 0
+
+        def _fill_from_path(path):
+            nonlocal col
+            if not path:
+                return
+            path_vox = np.asarray(path, dtype=np.float32)
+            dwell_mm = voxels_to_mm(path_vox, self.voxel_spacing_mm)
+            tangents = compute_path_tangents_mm(dwell_mm)
+            for i in range(dwell_mm.shape[0]):
+                weights = np.array([1.0], dtype=np.float32)
+                if self.dose_model == "blend":
+                    contrib = _blend_dose_numba_single(
+                        coords_mm,
+                        dwell_mm[i:i + 1],
+                        tangents[i:i + 1],
+                        weights,
+                        self.air_kerma_strength,
+                        blend_center_deg=self.tg43_blend_center_deg,
+                        blend_width_deg=self.tg43_blend_width_deg,
+                        flip_anisotropy=self.tg43_flip_anisotropy,
+                        cable_aniso_min=self.tg43_cable_aniso_min,
+                        cable_aniso_theta_deg=self.tg43_cable_aniso_theta_deg,
+                    )
+                else:
+                    contrib = _line_dose_numba_single(
+                        coords_mm,
+                        dwell_mm[i:i + 1],
+                        tangents[i:i + 1],
+                        weights,
+                        self.air_kerma_strength,
+                    )
+                A[:, col] = contrib
+                col += 1
+
+        _fill_from_path(tandem_path)
+        for path in ovoid_paths:
+            _fill_from_path(path)
+
+        if col != total_dwells:
+            return None
+
+        try:
+            w, *_ = np.linalg.lstsq(A, base_vals, rcond=None)
+        except np.linalg.LinAlgError:
+            return None
+
+        w = np.clip(w, self.tandem_opt_min_dwell, self.tandem_opt_max_dwell)
+        return w.astype(np.float32)
+
+    def _optimize_tandem_ovoid_dwells(self):
+        if self.base_dose_map is None:
+            return None
+
+        tandem_path = self._get_selected_tandem_path()
+        if not tandem_path:
+            return None
+
+        ovoid_paths = list(self.ovoid_paths or [])
+        total_dwells = len(tandem_path) + sum(len(p) for p in ovoid_paths)
+        if total_dwells == 0:
+            return None
+
+        base_current = self.base_dose_map * self.base_dose_scale
+        needle_only = self.dose_map - base_current
+
+        w0 = self._infer_initial_dwells_from_base(tandem_path, ovoid_paths)
+        if w0 is None or w0.size != total_dwells:
+            # fallback: uniform scale from HRCTV mean
+            tandem_unit = np.ones(len(tandem_path), dtype=np.float32)
+            ovoid_unit = [np.ones(len(p), dtype=np.float32) for p in ovoid_paths]
+            unit_dose = self._compute_tandem_ovoid_dose(tandem_unit, ovoid_unit)
+            hrctv_mask = (self.structure_mask == HRCTV_LABEL)
+            base_vals = self.base_dose_map[hrctv_mask]
+            unit_vals = unit_dose[hrctv_mask]
+            unit_mean = float(np.mean(unit_vals)) if unit_vals.size else 0.0
+            base_mean = float(np.mean(base_vals)) if base_vals.size else 0.0
+            scale = base_mean / max(unit_mean, 1e-6)
+            scale = float(np.clip(scale, self.tandem_opt_min_dwell, self.tandem_opt_max_dwell))
+            w0 = np.full(total_dwells, scale, dtype=np.float32)
+
+        bounds = [(self.tandem_opt_min_dwell, self.tandem_opt_max_dwell) for _ in range(total_dwells)]
+        best = {
+            "reward": -np.inf,
+            "w": w0,
+            "dose_map": None,
+            "metrics": None,
+            "coverage": None,
+            "oars": None,
+        }
+        best_hrctv = self.best_hrctv_d90
+
+        def _evaluate(w_vec):
+            offset = 0
+            tandem_w = w_vec[offset:offset + len(tandem_path)]
+            offset += len(tandem_path)
+            ovoid_w = []
+            for path in ovoid_paths:
+                ovoid_w.append(w_vec[offset:offset + len(path)])
+                offset += len(path)
+
+            base_dose = self._compute_tandem_ovoid_dose(tandem_w, ovoid_w)
+            dose_map = needle_only + base_dose
+            (
+                hrctv_d90,
+                hrctv_d98,
+                hrctv_mean,
+                rectum,
+                bladder,
+                sigmoid,
+                bowel,
+                vagina,
+            ) = compute_dose_metrics(dose_map, self.structure_mask, voxel_spacing_mm=self.voxel_spacing_mm, structure_flat_indices=self.structure_flat_indices)
+            coverage_vals = compute_hrctv_coverage(
+                dose_map, self.structure_mask, thresholds=(200.0, 400.0, 600.0), structure_flat_indices=self.structure_flat_indices
+            )
+            coverage_200, coverage_400, coverage_600 = coverage_vals
+            oar_doses = {
+                "Rectum": rectum,
+                "Bladder": bladder,
+                "Sigmoid": sigmoid,
+                "Bowel": bowel,
+                "Vagina": vagina,
+            }
+            delta_d90 = max(0.0, hrctv_d90 - best_hrctv)
+            reward = compute_reward(
+                hrctv_d90,
+                hrctv_d98,
+                hrctv_mean,
+                coverage_200,
+                coverage_400,
+                coverage_600,
+                oar_doses,
+                self.baseline_oar_doses,
+                self.needle_positions,
+                delta_d90,
+                total_dwell_time=self._total_needle_dwell_time(),
+                penalty=self.penalty,
+                stop=False,
+            )
+            return float(reward), dose_map, (hrctv_d90, hrctv_d98, hrctv_mean), (coverage_200, coverage_400, coverage_600), oar_doses
+
+        reward, dose_map, metrics, coverage, oars = _evaluate(w0)
+        best.update({"reward": reward, "w": w0, "dose_map": dose_map, "metrics": metrics, "coverage": coverage, "oars": oars})
+
+        if minimize is not None:
+            def _objective(x):
+                r, *_ = _evaluate(x)
+                return -r
+
+            res = minimize(
+                _objective,
+                w0,
+                method="L-BFGS-B",
+                bounds=bounds,
+                options={"maxiter": self.tandem_opt_max_iter},
+            )
+            if res.x is not None:
+                w_opt = np.clip(res.x.astype(np.float32), self.tandem_opt_min_dwell, self.tandem_opt_max_dwell)
+                reward, dose_map, metrics, coverage, oars = _evaluate(w_opt)
+                if reward >= best["reward"]:
+                    best.update({"reward": reward, "w": w_opt, "dose_map": dose_map, "metrics": metrics, "coverage": coverage, "oars": oars})
+
+        if best["dose_map"] is None:
+            return None
+
+        self.base_dose_map = best["dose_map"].astype(np.float32)
+        self.base_dose_scale = 1.0
+        self.dose_map = needle_only + self.base_dose_map
+
+        self._update_best_hrctv_d90(best["metrics"][0])
+        base_metrics = compute_dose_metrics(self.base_dose_map, self.structure_mask, voxel_spacing_mm=self.voxel_spacing_mm, structure_flat_indices=self.structure_flat_indices)
+        self.baseline_d90 = base_metrics[0]
+        self.baseline_d98 = base_metrics[1]
+
+        offset = 0
+        self.tandem_dwell_times = best["w"][offset:offset + len(tandem_path)].copy()
+        offset += len(tandem_path)
+        ovoid_dwells = []
+        for path in ovoid_paths:
+            ovoid_dwells.append(best["w"][offset:offset + len(path)].copy())
+            offset += len(path)
+        self.ovoid_dwell_times = ovoid_dwells
+
+        return {
+            "reward": best["reward"],
+            "hrctv_d90": best["metrics"][0],
+            "hrctv_d98": best["metrics"][1],
+            "hrctv_mean": best["metrics"][2],
+            "coverage_200": best["coverage"][0],
+            "coverage_400": best["coverage"][1],
+            "coverage_600": best["coverage"][2],
+            "oar_doses": best["oars"],
+        }
+
+    def _optimize_base_dose_scale(self):
+        if self.base_dose_map is None:
+            return None
+
+        base_map = self.base_dose_map
+        base_current = base_map * self.base_dose_scale
+        needle_only = self.dose_map - base_current
+
+        scales = self.tandem_opt_scales
+        if scales.size == 0:
+            scales = np.array([self.base_dose_scale], dtype=np.float32)
+        scales = np.unique(
+            np.clip(
+                np.concatenate([scales, np.array([self.base_dose_scale], dtype=np.float32)]),
+                self.tandem_opt_scale_min,
+                self.tandem_opt_scale_max,
+            )
+        )
+
+        best_reward = -np.inf
+        best_scale = None
+        best_metrics = None
+        best_coverage = None
+        best_oars = None
+        best_dose = None
+
+        for scale in scales:
+            dose_map = needle_only + base_map * float(scale)
+            (
+                hrctv_d90,
+                hrctv_d98,
+                hrctv_mean,
+                rectum,
+                bladder,
+                sigmoid,
+                bowel,
+                vagina,
+            ) = compute_dose_metrics(dose_map, self.structure_mask, voxel_spacing_mm=self.voxel_spacing_mm, structure_flat_indices=self.structure_flat_indices)
+            coverage_vals = compute_hrctv_coverage(
+                dose_map, self.structure_mask, thresholds=(200.0, 400.0, 600.0), structure_flat_indices=self.structure_flat_indices
+            )
+            coverage_200, coverage_400, coverage_600 = coverage_vals
+            oar_doses = {
+                "Rectum": rectum,
+                "Bladder": bladder,
+                "Sigmoid": sigmoid,
+                "Bowel": bowel,
+                "Vagina": vagina,
+            }
+            delta_d90 = max(0.0, hrctv_d90 - self.best_hrctv_d90)
+            reward = compute_reward(
+                hrctv_d90,
+                hrctv_d98,
+                hrctv_mean,
+                coverage_200,
+                coverage_400,
+                coverage_600,
+                oar_doses,
+                self.baseline_oar_doses,
+                self.needle_positions,
+                delta_d90,
+                total_dwell_time=self._total_needle_dwell_time(),
+                penalty=self.penalty,
+                stop=False,
+            )
+            if reward > best_reward:
+                best_reward = float(reward)
+                best_scale = float(scale)
+                best_metrics = (hrctv_d90, hrctv_d98, hrctv_mean)
+                best_coverage = (coverage_200, coverage_400, coverage_600)
+                best_oars = oar_doses
+                best_dose = dose_map
+
+        if best_scale is None:
+            return None
+
+        self.base_dose_scale = best_scale
+        self.dose_map = best_dose
+        self._update_best_hrctv_d90(best_metrics[0])
+
+        base_only = base_map * self.base_dose_scale
+        base_metrics = compute_dose_metrics(base_only, self.structure_mask, voxel_spacing_mm=self.voxel_spacing_mm, structure_flat_indices=self.structure_flat_indices)
+        self.baseline_d90 = base_metrics[0]
+        self.baseline_d98 = base_metrics[1]
+
+        return {
+            "reward": best_reward,
+            "hrctv_d90": best_metrics[0],
+            "hrctv_d98": best_metrics[1],
+            "hrctv_mean": best_metrics[2],
+            "coverage_200": best_coverage[0],
+            "coverage_400": best_coverage[1],
+            "coverage_600": best_coverage[2],
+            "oar_doses": best_oars,
+            "scale": best_scale,
+        }
+
+    def _crop_plane(self, plane, center_row, center_col):
+        size = self.slice_size
+        half = size // 2
+        r0 = int(round(center_row)) - half
+        c0 = int(round(center_col)) - half
+        r1 = r0 + size
+        c1 = c0 + size
+
+        pad_top = max(0, -r0)
+        pad_left = max(0, -c0)
+        pad_bottom = max(0, r1 - plane.shape[0])
+        pad_right = max(0, c1 - plane.shape[1])
+
+        if pad_top or pad_bottom or pad_left or pad_right:
+            plane = np.pad(
+                plane,
+                ((pad_top, pad_bottom), (pad_left, pad_right)),
+                mode="constant",
+            )
+        r0 = max(r0, 0)
+        c0 = max(c0, 0)
+        r1 = r0 + size
+        c1 = c0 + size
+        return plane[r0:r1, c0:c1]
+
+    def _extract_isodose_slices(self, include_masks=True):
+        zc, yc, xc = self.hrctv_centroid
+        slices = []
+        for off in self.slice_offsets:
+            z_idx = int(np.clip(zc + off, 0, self.dose_map.shape[0] - 1))
+            axial = self._crop_plane(self.dose_map[z_idx], yc, xc)
+            slices.append(axial)
+        for off in self.slice_offsets:
+            y_idx = int(np.clip(yc + off, 0, self.dose_map.shape[1] - 1))
+            sagittal = self._crop_plane(self.dose_map[:, y_idx, :], zc, xc)
+            slices.append(sagittal)
+        for off in self.slice_offsets:
+            x_idx = int(np.clip(xc + off, 0, self.dose_map.shape[2] - 1))
+            coronal = self._crop_plane(self.dose_map[:, :, x_idx], zc, yc)
+            slices.append(coronal)
+        stack = np.stack(slices, axis=0)
+        stack = np.clip(stack / self.slice_scale, 0.0, 5.0)
+
+        if include_masks and self.num_mask_channels:
+            mask_slices = []
+            for vol in self.obs_mask_volumes:
+                for off in self.slice_offsets:
+                    z_idx = int(np.clip(zc + off, 0, vol.shape[0] - 1))
+                    axial = self._crop_plane(vol[z_idx].astype(np.float32), yc, xc)
+                    mask_slices.append(axial)
+                for off in self.slice_offsets:
+                    y_idx = int(np.clip(yc + off, 0, vol.shape[1] - 1))
+                    sagittal = self._crop_plane(vol[:, y_idx, :].astype(np.float32), zc, xc)
+                    mask_slices.append(sagittal)
+                for off in self.slice_offsets:
+                    x_idx = int(np.clip(xc + off, 0, vol.shape[2] - 1))
+                    coronal = self._crop_plane(vol[:, :, x_idx].astype(np.float32), zc, yc)
+                    mask_slices.append(coronal)
+            stack = np.concatenate([stack.astype(np.float32), np.stack(mask_slices, axis=0)], axis=0)
+        return stack.astype(np.float32)
+
+    def _hrctv_histogram(self):
+        hrctv_vals = self.dose_map[self.structure_mask == HRCTV_LABEL]
+        bins = np.array([0.0, 200.0, 400.0, 600.0, 800.0, 1200.0], dtype=np.float32)
+        hist = np.zeros(len(bins) - 1, dtype=np.float32)
+        if hrctv_vals.size == 0:
+            return hist
+        counts, _ = np.histogram(hrctv_vals, bins=bins)
+        total = max(1, counts.sum())
+        hist = counts.astype(np.float32) / float(total)
+        return hist
+
+    def render(self, mode="human"):
+        slices = self._extract_isodose_slices(include_masks=False)
+        if mode == "array":
+            return slices
+        if mode != "human":
+            raise ValueError(f"Unsupported render mode: {mode}")
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError as exc:
+            raise RuntimeError("matplotlib is required for render(mode='human')") from exc
+
+        fig, axes = plt.subplots(1, 3, figsize=(9, 3))
+        titles = ["Axial", "Sagittal", "Coronal"]
+        for ax, plane, title in zip(axes, slices, titles):
+            im = ax.imshow(plane, cmap="inferno", vmin=0, vmax=5)
+            ax.set_title(title)
+            ax.axis("off")
+        fig.colorbar(im, ax=axes, fraction=0.046, pad=0.04, label="Dose / slice_scale")
+        fig.tight_layout()
+        plt.show()
+
+    def _apply_cached_dose(self, path_idx, path_vox, dwell_for_path):
+        """Accumulate dose using either the kernel cache or line TG-43."""
+        weights = dwell_for_path[:len(path_vox)].astype(np.float32)
+
+        if self.dose_model in {"line", "blend"}:
+            positions = np.asarray(path_vox, dtype=np.float32)
+            path_mm = voxels_to_mm(positions, self.voxel_spacing_mm)
+            tangents = compute_path_tangents_mm(path_mm)
+            delta = deposit_line_superposition(
+                positions,
+                weights,
+                self.structure_mask,
+                self.voxel_spacing_mm,
+                self.label_mapping,
+                include_structures=self.dose_structures,
+                air_kerma_strength=self.air_kerma_strength,
+                structure_indices=self.structure_indices,
+                precomputed_coords=self.structure_coords_mm,
+                path_tangents=tangents,
+                dose_model=self.dose_model,
+                blend_center_deg=self.tg43_blend_center_deg,
+                blend_width_deg=self.tg43_blend_width_deg,
+                flip_anisotropy=self.tg43_flip_anisotropy,
+                cable_aniso_min=self.tg43_cable_aniso_min,
+                cable_aniso_theta_deg=self.tg43_cable_aniso_theta_deg,
+            )
+            self.dose_map += delta
+            return 0.0
+
+        contributions = self.path_kernel_cache[path_idx]
+        flat = self.dose_map.reshape(-1)
+
+        max_len = len(contributions)
+        contrib_idx = [entry[0] for entry in contributions]
+        contrib_val = [entry[1] for entry in contributions]
+        weights = dwell_for_path[:max_len].astype(np.float32)
+
+        hits = scatter_add_dose(flat, contrib_idx, contrib_val, weights)
+        active_positions = int(np.count_nonzero(weights > 0))
+        misses = active_positions - hits
+        path_mm = voxels_to_mm(np.asarray(path_vox, dtype=np.float32), self.voxel_spacing_mm)
+        tangents = compute_path_tangents_mm(path_mm)
+        add_far_field_tail(
+            self.dose_map,
+            path_vox,
+            weights,
+            self.structure_indices,
+            self.structure_coords_mm,
+            self.voxel_spacing_mm,
+            self.kernel_radius_mm,
+            include_labels=self.structure_labels,
+            air_kerma_strength=self.air_kerma_strength,
+            path_tangents=tangents,
+        )
+        return -misses * MISS_PENALTY_WEIGHT
+
+    # ============================================================
+    # RESET
+    # ============================================================
+    def reset(self, *, seed=None, options=None):
+        super().reset(seed=seed)
+
+        self.needle_positions = []
+        self.needle_paths = []
+        self.needle_path_indices = []
+        self.needle_dwells = []
+        self.needle_min_dwell_idx = []
+        self.needle_max_dwell_idx = []
+        self.proximity_penalties = []
+        self.dose_map = np.zeros_like(self.structure_mask, dtype=np.float32)
+        self.last_dwell_times = np.zeros(self.max_path_points, dtype=np.float32)
+        self.penalty = 0.0
+        self.base_dose_scale = 1.0
+        if self.base_dose_map is not None:
+            self.dose_map += self.base_dose_map * self.base_dose_scale
+        self.episode_steps = 0
+
+        obs = self._get_obs()
+        (
+            hrctv_d90,
+            hrctv_d98,
+            hrctv_mean,
+            rectum,
+            bladder,
+            sigmoid,
+            bowel,
+            vagina,
+        ) = compute_dose_metrics(self.dose_map, self.structure_mask, voxel_spacing_mm=self.voxel_spacing_mm, structure_flat_indices=self.structure_flat_indices)
+        info = {
+            "needles": 0,
+            "tandem_seed": self.base_dose_map is not None,
+            "hrctv_d90": hrctv_d90,
+            "hrctv_d98": hrctv_d98,
+            "hrctv_mean": hrctv_mean,
+            "oar_doses": {
+                "Rectum": rectum,
+                "Bladder": bladder,
+                "Sigmoid": sigmoid,
+                "Bowel": bowel,
+                "Vagina": vagina,
+            },
+        }
+        self.last_reset_info = info
+        self.baseline_d90 = hrctv_d90
+        self.baseline_d98 = hrctv_d98
+        self.baseline_oar_doses = dict(info["oar_doses"])
+        self.last_hrctv_d90 = hrctv_d90
+        self.best_hrctv_d90 = self._cap_hrctv_d90(hrctv_d90)
+
+        if self.log_steps:
+            print(f"[RESET] Baseline (tandem/ovoid) HRCTV D90={hrctv_d90:.2f} D98={hrctv_d98:.2f}")
+
+        return obs, info
+
+    # ============================================================
+    # STEP
+    # ============================================================
+    def step(self, action):
+        step_start = time.time()
+        self.episode_steps += 1
+
+        action_vec = np.asarray(action, dtype=np.float32).reshape(-1)
+        if action_vec.shape[0] != self.action_space.shape[0]:
+            raise ValueError(
+                f"Expected action with {self.action_space.shape[0]} dims, got {action_vec.shape}"
+            )
+
+        selector = float(np.clip(0.5 * (action_vec[0] + 1.0), 0.0, 0.999999))
+        choice = int(selector * (self.n_paths + 2))
+        optimize_selected = (choice == self.n_paths)
+        stop_selected = (choice >= self.n_paths + 1)
+
+        # -------------------------------------------------------
+        # Agent chooses TANDEM/OVOID OPTIMIZATION
+        # -------------------------------------------------------
+        if optimize_selected:
+            if not self.enable_tandem_opt:
+                (
+                    hrctv_d90,
+                    hrctv_d98,
+                    hrctv_mean,
+                    rectum,
+                    bladder,
+                    sigmoid,
+                    bowel,
+                    vagina,
+                ) = compute_dose_metrics(
+                    self.dose_map,
+                    self.structure_mask,
+                    voxel_spacing_mm=self.voxel_spacing_mm,
+                    structure_flat_indices=self.structure_flat_indices,
+                )
+                coverage_vals = compute_hrctv_coverage(
+                    self.dose_map,
+                    self.structure_mask,
+                    thresholds=(200.0, 400.0, 600.0),
+                    structure_flat_indices=self.structure_flat_indices,
+                )
+                coverage_200, coverage_400, coverage_600 = coverage_vals
+                oar_doses = {
+                    "Rectum": rectum,
+                    "Bladder": bladder,
+                    "Sigmoid": sigmoid,
+                    "Bowel": bowel,
+                    "Vagina": vagina,
+                }
+                delta_d90 = max(0.0, hrctv_d90 - self.best_hrctv_d90)
+                self._update_best_hrctv_d90(hrctv_d90)
+                reward = compute_reward(
+                    hrctv_d90,
+                    hrctv_d98,
+                    hrctv_mean,
+                    coverage_200,
+                    coverage_400,
+                    coverage_600,
+                    oar_doses,
+                    self.baseline_oar_doses,
+                    self.needle_positions,
+                    delta_d90,
+                    total_dwell_time=self._total_needle_dwell_time(),
+                    penalty=self.penalty,
+                    stop=False,
+                )
+                self.last_hrctv_d90 = hrctv_d90
+                exceeded = self.episode_steps >= self.max_episode_steps
+                low_needle_penalty = 0.0
+                if exceeded:
+                    low_needle_penalty = self._low_needle_penalty(len(self.needle_positions))
+                    if low_needle_penalty:
+                        reward -= low_needle_penalty
+                obs = self._get_obs()
+                return obs, float(reward), exceeded, False, {
+                    "needles": len(self.needle_positions),
+                    "hrctv_d90": hrctv_d90,
+                    "hrctv_d98": hrctv_d98,
+                    "hrctv_mean": hrctv_mean,
+                    "coverage_400": coverage_400,
+                    "coverage_600": coverage_600,
+                    "coverage_200": coverage_200,
+                    "oar_doses": oar_doses,
+                    "last_needle_path": None,
+                    "used_library": False,
+                    "tandem_seed": self.base_dose_map is not None,
+                    "tandem_optimize": False,
+                    "tandem_scale": self.base_dose_scale,
+                    "optimize_skipped": "disabled",
+                    "proximity_penalty": self.penalty,
+                    "edit_delta_abs_max": 0.0,
+                    "path_idx": -1,
+                    "max_needles_reached": len(self.needle_positions) >= self.max_needles,
+                    "max_steps_reached": exceeded,
+                    "low_needle_penalty": float(low_needle_penalty),
+                    "min_needles_for_stop": int(self.min_needles_for_stop),
+                    "needle_target": int(self.needle_target),
+                }
+            if self.log_steps:
+                print(f"[STEP] OPTIMIZE tandem/ovoid scale (needles={len(self.needle_positions)})")
+            if self.base_dose_map is None:
+                (
+                    hrctv_d90,
+                    hrctv_d98,
+                    hrctv_mean,
+                    rectum,
+                    bladder,
+                    sigmoid,
+                    bowel,
+                    vagina,
+                ) = compute_dose_metrics(self.dose_map, self.structure_mask, voxel_spacing_mm=self.voxel_spacing_mm, structure_flat_indices=self.structure_flat_indices)
+                coverage_vals = compute_hrctv_coverage(
+                    self.dose_map, self.structure_mask, thresholds=(200.0, 400.0, 600.0), structure_flat_indices=self.structure_flat_indices
+                )
+                coverage_200, coverage_400, coverage_600 = coverage_vals
+                oar_doses = {
+                    "Rectum": rectum,
+                    "Bladder": bladder,
+                    "Sigmoid": sigmoid,
+                    "Bowel": bowel,
+                    "Vagina": vagina,
+                }
+                delta_d90 = max(0.0, hrctv_d90 - self.best_hrctv_d90)
+                self._update_best_hrctv_d90(hrctv_d90)
+                reward = compute_reward(
+                    hrctv_d90,
+                    hrctv_d98,
+                    hrctv_mean,
+                    coverage_200,
+                    coverage_400,
+                    coverage_600,
+                    oar_doses,
+                    self.baseline_oar_doses,
+                    self.needle_positions,
+                    delta_d90,
+                    total_dwell_time=self._total_needle_dwell_time(),
+                    penalty=self.penalty,
+                    stop=False,
+                )
+                self.last_hrctv_d90 = hrctv_d90
+                exceeded = self.episode_steps >= self.max_episode_steps
+                low_needle_penalty = 0.0
+                if exceeded:
+                    low_needle_penalty = self._low_needle_penalty(len(self.needle_positions))
+                    if low_needle_penalty:
+                        reward -= low_needle_penalty
+                obs = self._get_obs()
+                return obs, float(reward), exceeded, False, {
+                    "needles": len(self.needle_positions),
+                    "hrctv_d90": hrctv_d90,
+                    "hrctv_d98": hrctv_d98,
+                    "hrctv_mean": hrctv_mean,
+                    "coverage_400": coverage_400,
+                    "coverage_600": coverage_600,
+                    "coverage_200": coverage_200,
+                    "oar_doses": oar_doses,
+                    "last_needle_path": None,
+                    "used_library": False,
+                    "tandem_seed": self.base_dose_map is not None,
+                    "tandem_optimize": False,
+                    "tandem_scale": self.base_dose_scale,
+                    "optimize_skipped": "no_base_dose",
+                    "proximity_penalty": self.penalty,
+                    "edit_delta_abs_max": 0.0,
+                    "path_idx": -1,
+                    "max_needles_reached": len(self.needle_positions) >= self.max_needles,
+                    "max_steps_reached": exceeded,
+                    "low_needle_penalty": float(low_needle_penalty),
+                    "min_needles_for_stop": int(self.min_needles_for_stop),
+                    "needle_target": int(self.needle_target),
+                }
+
+            opt_result = self._optimize_tandem_ovoid_dwells()
+            if opt_result is None:
+                opt_result = self._optimize_base_dose_scale()
+            if opt_result is None:
+                exceeded = self.episode_steps >= self.max_episode_steps
+                low_needle_penalty = 0.0
+                if exceeded:
+                    low_needle_penalty = self._low_needle_penalty(len(self.needle_positions))
+                obs = self._get_obs()
+                reward = -float(low_needle_penalty) if low_needle_penalty else 0.0
+                return obs, float(reward), exceeded, False, {
+                    "needles": len(self.needle_positions),
+                    "tandem_seed": self.base_dose_map is not None,
+                    "tandem_optimize": False,
+                    "tandem_scale": self.base_dose_scale,
+                    "optimize_skipped": "opt_failed",
+                    "max_needles_reached": len(self.needle_positions) >= self.max_needles,
+                    "max_steps_reached": exceeded,
+                    "low_needle_penalty": float(low_needle_penalty),
+                    "min_needles_for_stop": int(self.min_needles_for_stop),
+                    "needle_target": int(self.needle_target),
+                }
+
+            hrctv_d90 = opt_result["hrctv_d90"]
+            hrctv_d98 = opt_result["hrctv_d98"]
+            hrctv_mean = opt_result["hrctv_mean"]
+            coverage_200 = opt_result["coverage_200"]
+            coverage_400 = opt_result["coverage_400"]
+            coverage_600 = opt_result["coverage_600"]
+            oar_doses = opt_result["oar_doses"]
+            reward = opt_result["reward"]
+            exceeded = self.episode_steps >= self.max_episode_steps
+            self.last_hrctv_d90 = hrctv_d90
+            low_needle_penalty = 0.0
+            if exceeded:
+                low_needle_penalty = self._low_needle_penalty(len(self.needle_positions))
+                if low_needle_penalty:
+                    reward -= low_needle_penalty
+            obs = self._get_obs()
+            return obs, float(reward), exceeded, False, {
+                "needles": len(self.needle_positions),
+                "hrctv_d90": hrctv_d90,
+                "hrctv_d98": hrctv_d98,
+                "hrctv_mean": hrctv_mean,
+                "coverage_400": coverage_400,
+                "coverage_600": coverage_600,
+                "coverage_200": coverage_200,
+                "oar_doses": oar_doses,
+                "last_needle_path": None,
+                "used_library": False,
+                "tandem_seed": self.base_dose_map is not None,
+                "tandem_optimize": True,
+                "tandem_scale": self.base_dose_scale,
+                "proximity_penalty": self.penalty,
+                "edit_delta_abs_max": 0.0,
+                "path_idx": -1,
+                "max_needles_reached": len(self.needle_positions) >= self.max_needles,
+                "max_steps_reached": exceeded,
+                "low_needle_penalty": float(low_needle_penalty),
+                "min_needles_for_stop": int(self.min_needles_for_stop),
+                "needle_target": int(self.needle_target),
+            }
+
+        # -------------------------------------------------------
+        # Agent chooses STOP
+        # -------------------------------------------------------
+        if stop_selected:
+            if self.log_steps:
+                print(f"[STEP] STOP action, needles={len(self.needle_positions)}")
+            # Final metrics
+            (
+                hrctv_d90,
+                hrctv_d98,
+                hrctv_mean,
+                rectum,
+                bladder,
+                sigmoid,
+                bowel,
+                vagina,
+            ) = compute_dose_metrics(self.dose_map, self.structure_mask, voxel_spacing_mm=self.voxel_spacing_mm, structure_flat_indices=self.structure_flat_indices)
+            coverage_vals = compute_hrctv_coverage(
+                self.dose_map, self.structure_mask, thresholds=(200.0, 400.0, 600.0), structure_flat_indices=self.structure_flat_indices
+            )
+            coverage_200, coverage_400, coverage_600 = coverage_vals
+
+            oar_doses = {
+                "Rectum": rectum,
+                "Bladder": bladder,
+                "Sigmoid": sigmoid,
+                "Bowel": bowel,
+                "Vagina": vagina
+            }
+
+            final_spacing_penalty = self._final_spacing_penalty()
+            delta_d90 = max(0.0, hrctv_d90 - self.best_hrctv_d90)
+            self._update_best_hrctv_d90(hrctv_d90)
+            reward = compute_reward(
+                hrctv_d90,
+                hrctv_d98,
+                hrctv_mean,
+                coverage_200,
+                coverage_400,
+                coverage_600,
+                oar_doses,
+                self.baseline_oar_doses,
+                self.needle_positions,
+                delta_d90,
+                total_dwell_time=self._total_needle_dwell_time(),
+                penalty=final_spacing_penalty,
+                stop=True
+            )
+            self.last_hrctv_d90 = hrctv_d90
+            low_needle_penalty = self._low_needle_penalty(len(self.needle_positions))
+            if low_needle_penalty:
+                reward -= low_needle_penalty
+
+            obs = self._get_obs()
+            if self.log_steps:
+                print(f"[STEP] STOP metrics computed in {time.time()-step_start:.2f}s")
+            return obs, float(reward), True, False, {
+                "stopped_early": True,
+                "tandem_seed": self.base_dose_map is not None,
+                "hrctv_d90": hrctv_d90,
+                "hrctv_d98": hrctv_d98,
+                "oar_doses": oar_doses,
+                "hrctv_mean": hrctv_mean,
+                "coverage_400": coverage_400,
+                "coverage_600": coverage_600,
+                "coverage_200": coverage_200,
+                "proximity_penalty": final_spacing_penalty,
+                "needles": len(self.needle_positions),
+                "needle_paths": [list(path) for path in self.needle_paths],
+                "low_needle_penalty": float(low_needle_penalty),
+                "min_needles_for_stop": int(self.min_needles_for_stop),
+                "needle_target": int(self.needle_target),
+                "max_steps_reached": self.episode_steps >= self.max_episode_steps,
+            }
+
+        # -------------------------------------------------------
+        # Otherwise: INSERT OR EDIT SELECTED NEEDLE PATH
+        # -------------------------------------------------------
+        if self.log_steps:
+            if choice in self.needle_path_indices:
+                print(f"[STEP] Editing needle (path={choice})")
+            else:
+                print(f"[STEP] Inserting needle {len(self.needle_positions)+1} (path={choice})")
+
+        needle = self.anatomical_library[choice]
+        path_vox = needle["path_vox"]                   # full curved path
+        path_len = len(path_vox)
+        final_tip = path_vox[-1] if path_len else None
+        min_dwell_idx = int(needle.get("min_dwell_idx", 0) or 0)
+        max_dwell_idx = needle.get("max_dwell_idx", None)
+        if max_dwell_idx is not None:
+            max_dwell_idx = int(max_dwell_idx)
+
+        band_low = self.d90_target - self.d90_tol
+        band_high = self.d90_target + self.d90_tol
+        scale = 1.0
+        if self.last_hrctv_d90 < band_low:
+            scale = self.delta_scale_under
+        elif self.last_hrctv_d90 > band_high:
+            scale = self.delta_scale_over
+        else:
+            scale = self.delta_scale_inband
+        dwell_delta_flat = (
+            np.clip(action_vec[1:], -1.0, 1.0).astype(np.float32)
+            * self.delta_max_seconds
+            * float(scale)
+        )
+        min_entry_mm = max(2.0, float(self.min_path_separation_mm))
+        resampled_from = None
+        new_path = False
+        new_needle_idx = None
+
+        if choice in self.needle_path_indices:
+            active_idx = self.needle_path_indices.index(choice)
+            dwell_for_path = self.needle_dwells[active_idx]
+        else:
+            if len(self.needle_positions) >= self.max_needles:
+                obs = self._get_obs()
+                exceeded = self.episode_steps >= self.max_episode_steps
+                return obs, 0.0, exceeded, False, {
+                    "needles": len(self.needle_positions),
+                    "tandem_seed": self.base_dose_map is not None,
+                    "max_steps_reached": exceeded,
+                    "max_needles_reached": True,
+                }
+            valid, reason = self._is_valid_new_path(path_vox, min_entry_mm, min_dwell_idx, max_dwell_idx)
+            if not valid:
+                alt = self._find_valid_alternative_path(path_vox, min_entry_mm, skip_index=choice)
+                if alt is None:
+                    if self.log_steps:
+                        print(f"[STEP] Rejected needle due to {reason}; no valid alternatives")
+                    (
+                        hrctv_d90,
+                        hrctv_d98,
+                        hrctv_mean,
+                        rectum,
+                        bladder,
+                        sigmoid,
+                        bowel,
+                        vagina,
+                    ) = compute_dose_metrics(self.dose_map, self.structure_mask, voxel_spacing_mm=self.voxel_spacing_mm, structure_flat_indices=self.structure_flat_indices)
+                    coverage_vals = compute_hrctv_coverage(
+                        self.dose_map, self.structure_mask, thresholds=(200.0, 400.0, 600.0), structure_flat_indices=self.structure_flat_indices
+                    )
+                    coverage_200, coverage_400, coverage_600 = coverage_vals
+                    info = {
+                        "needles": len(self.needle_positions),
+                        "hrctv_d90": hrctv_d90,
+                        "hrctv_d98": hrctv_d98,
+                        "hrctv_mean": hrctv_mean,
+                        "coverage_400": coverage_400,
+                        "coverage_600": coverage_600,
+                        "coverage_200": coverage_200,
+                        "oar_doses": {
+                            "Rectum": rectum,
+                            "Bladder": bladder,
+                            "Sigmoid": sigmoid,
+                            "Bowel": bowel,
+                            "Vagina": vagina,
+                        },
+                        "last_needle_path": None,
+                        "used_library": False,
+                        "tandem_seed": self.base_dose_map is not None,
+                        "proximity_penalty": 0.0,
+                        "invalid_action": True,
+                        "invalid_reason": reason,
+                    }
+                    exceeded = self.episode_steps >= self.max_episode_steps
+                    info["max_steps_reached"] = exceeded
+                    obs = self._get_obs()
+                    return obs, 0.0, exceeded, False, info
+                resampled_from = choice
+                choice, path_vox = alt
+                needle = self.anatomical_library[choice]
+                path_len = len(path_vox)
+                final_tip = path_vox[-1] if path_len else None
+                min_dwell_idx = int(needle.get("min_dwell_idx", 0) or 0)
+                max_dwell_idx = needle.get("max_dwell_idx", None)
+                if max_dwell_idx is not None:
+                    max_dwell_idx = int(max_dwell_idx)
+                if self.log_steps:
+                    print(f"[STEP] Resampled invalid path {resampled_from} -> {choice}")
+
+            if path_len == 0:
+                obs = self._get_obs()
+                exceeded = self.episode_steps >= self.max_episode_steps
+                return obs, 0.0, exceeded, False, {
+                    "needles": len(self.needle_positions),
+                    "tandem_seed": self.base_dose_map is not None,
+                    "max_steps_reached": exceeded,
+                    "invalid_action": True,
+                    "invalid_reason": "empty_path",
+                }
+
+            # Record trajectory + tip
+            self.needle_paths.append(path_vox)
+            self.needle_positions.append(final_tip)
+            self.needle_path_indices.append(choice)
+            seed_time = min(1.0, float(self.max_dwell_time))
+            dwell_for_path = np.full(path_len, seed_time, dtype=np.float32)
+            if min_dwell_idx > 0:
+                dwell_for_path[:min_dwell_idx] = 0.0
+            if max_dwell_idx is not None and max_dwell_idx + 1 < path_len:
+                dwell_for_path[max_dwell_idx + 1:] = 0.0
+            self.needle_dwells.append(dwell_for_path)
+            self.needle_min_dwell_idx.append(min_dwell_idx)
+            self.needle_max_dwell_idx.append(max_dwell_idx)
+            new_path = True
+            new_needle_idx = len(self.needle_dwells) - 1
+
+            proximity_penalty = 0.0
+            if self.min_path_separation_mm is not None and len(self.needle_paths) > 1:
+                for prev_path in self.needle_paths[:-1]:
+                    dist_mm = self._path_min_distance_mm(prev_path, path_vox)
+                    if dist_mm < self.min_path_separation_mm:
+                        overlap_ratio = 1.0 - dist_mm / max(self.min_path_separation_mm, 1e-6)
+                        proximity_penalty += self.overlap_penalty * overlap_ratio
+            self.proximity_penalties.append(proximity_penalty)
+
+        needle_hit_frac = None
+        needle_insert_bonus = 0.0
+        if new_path:
+            needle_hit_frac = self._needle_hit_fraction(path_vox, min_dwell_idx, max_dwell_idx)
+            if self.needle_target > 0 and self.needle_insert_bonus > 0.0:
+                prev_count = max(0, len(self.needle_positions) - 1)
+                prev_progress = min(1.0, prev_count / float(self.needle_target))
+                curr_progress = min(1.0, len(self.needle_positions) / float(self.needle_target))
+                delta_progress = max(0.0, curr_progress - prev_progress)
+                needle_insert_bonus = self.needle_insert_bonus * delta_progress * float(needle_hit_frac)
+
+        if new_path and new_needle_idx is not None:
+            start = new_needle_idx * self.max_path_points
+            end = start + self.max_path_points
+            dwell_delta_flat[start:end] = np.maximum(dwell_delta_flat[start:end], 0.0)
+
+        for idx, dwell_vec in enumerate(self.needle_dwells):
+            start = idx * self.max_path_points
+            if start >= dwell_delta_flat.size:
+                break
+            delta_vec = dwell_delta_flat[start:start + self.max_path_points]
+            path_len = len(dwell_vec)
+            if path_len:
+                dwell_vec[:path_len] = np.clip(
+                    dwell_vec[:path_len] + delta_vec[:path_len], 0.0, self.max_dwell_time
+                )
+                min_idx = self.needle_min_dwell_idx[idx] if idx < len(self.needle_min_dwell_idx) else 0
+                if min_idx > 0:
+                    dwell_vec[:min_idx] = 0.0
+                max_idx = None
+                if idx < len(self.needle_max_dwell_idx):
+                    max_idx = self.needle_max_dwell_idx[idx]
+                if max_idx is not None and max_idx + 1 < path_len:
+                    dwell_vec[max_idx + 1:] = 0.0
+            self.needle_dwells[idx] = dwell_vec
+
+        active_idx = self.needle_path_indices.index(choice)
+        self.last_dwell_times.fill(0.0)
+        active_vec = self.needle_dwells[active_idx]
+        self.last_dwell_times[: len(active_vec)] = active_vec
+
+        # Recompute dose map from scratch (tandem seed + all needles)
+        if self.base_dose_map is not None:
+            self.dose_map = self.base_dose_map * self.base_dose_scale
+        else:
+            self.dose_map.fill(0.0)
+        penalty = 0.0
+        for idx, path_idx in enumerate(self.needle_path_indices):
+            penalty += self._apply_cached_dose(
+                path_idx,
+                self.needle_paths[idx],
+                self.needle_dwells[idx],
+            )
+        proximity_penalty = float(np.sum(self.proximity_penalties)) if self.proximity_penalties else 0.0
+        self.penalty = penalty + proximity_penalty
+
+        if self.log_steps:
+            hrctv_max = self.dose_map[self.structure_mask == HRCTV_LABEL].max(initial=0)
+            print(f"[STEP] HRCTV max dose so far: {hrctv_max}")
+
+        # -------------------------------------------------------
+        # Compute dose metrics + reward
+        # -------------------------------------------------------
+        (
+            hrctv_d90,
+            hrctv_d98,
+            hrctv_mean,
+            rectum,
+            bladder,
+            sigmoid,
+            bowel,
+            vagina,
+        ) = compute_dose_metrics(self.dose_map, self.structure_mask, voxel_spacing_mm=self.voxel_spacing_mm, structure_flat_indices=self.structure_flat_indices)
+        coverage_vals = compute_hrctv_coverage(
+            self.dose_map, self.structure_mask, thresholds=(200.0, 400.0, 600.0), structure_flat_indices=self.structure_flat_indices
+        )
+        coverage_200, coverage_400, coverage_600 = coverage_vals
+
+        oar_doses = {
+            "Rectum": rectum,
+            "Bladder": bladder,
+            "Sigmoid": sigmoid,
+            "Bowel": bowel,
+            "Vagina": vagina
+        }
+        
+        delta_d90 = max(0.0, hrctv_d90 - self.best_hrctv_d90)
+        self._update_best_hrctv_d90(hrctv_d90)
+
+        reward = compute_reward(
+            hrctv_d90,
+            hrctv_d98,
+            hrctv_mean,
+            coverage_200,
+            coverage_400,
+            coverage_600,
+            oar_doses,
+            self.baseline_oar_doses,
+            self.needle_positions,
+            delta_d90,
+            total_dwell_time=self._total_needle_dwell_time(),
+            penalty=self.penalty,
+            stop=False
+        )
+        self.last_hrctv_d90 = hrctv_d90
+        if needle_insert_bonus:
+            reward += float(needle_insert_bonus)
+
+        # -------------------------------------------------------
+        # Termination (max needles)
+        # -------------------------------------------------------
+        exceeded = self.episode_steps >= self.max_episode_steps
+        low_needle_penalty = 0.0
+        if exceeded:
+            low_needle_penalty = self._low_needle_penalty(len(self.needle_positions))
+            if low_needle_penalty:
+                reward -= low_needle_penalty
+        done = exceeded
+
+        obs = self._get_obs()
+        delta_abs_max = float(np.max(np.abs(dwell_delta_flat))) if dwell_delta_flat.size else 0.0
+        info = {
+            "needles": len(self.needle_positions),
+            "hrctv_d90": hrctv_d90,
+            "hrctv_d98": hrctv_d98,
+            "hrctv_mean": hrctv_mean,
+            "coverage_400": coverage_400,
+            "coverage_600": coverage_600,
+            "coverage_200": coverage_200,
+            "oar_doses": oar_doses,
+            "last_needle_path": path_vox,
+            "used_library": True,
+            "tandem_seed": self.base_dose_map is not None,
+            "proximity_penalty": proximity_penalty,
+            "edit_delta_abs_max": delta_abs_max,
+            "path_idx": int(choice),
+            "max_needles_reached": len(self.needle_positions) >= self.max_needles,
+            "max_steps_reached": exceeded,
+            "needle_insert_bonus": float(needle_insert_bonus),
+            "needle_hit_frac": None if needle_hit_frac is None else float(needle_hit_frac),
+            "needle_target": int(self.needle_target),
+            "low_needle_penalty": float(low_needle_penalty),
+            "min_needles_for_stop": int(self.min_needles_for_stop),
+        }
+        if resampled_from is not None:
+            info["resampled_from"] = int(resampled_from)
+
+        return obs, float(reward), done, False, info
+
+    # ============================================================
+    # OBSERVATIONS
+    # ============================================================
+    def _get_obs(self):
+
+        (
+            hrctv_d90,
+            _,
+            _,
+            rectum,
+            bladder,
+            sigmoid,
+            bowel,
+            vagina,
+        ) = compute_dose_metrics(self.dose_map, self.structure_mask, voxel_spacing_mm=self.voxel_spacing_mm, structure_flat_indices=self.structure_flat_indices)
+        coverage_vals = compute_hrctv_coverage(
+            self.dose_map, self.structure_mask, thresholds=(200.0, 400.0, 600.0), structure_flat_indices=self.structure_flat_indices
+        )
+        coverage_200, coverage_400, coverage_600 = coverage_vals
+
+        frac_needles = len(self.needle_positions) / self.max_needles
+        dose_hist = self._hrctv_histogram()
+
+        if self.dwell_flat_len:
+            dwell_flat = np.zeros(self.dwell_flat_len, dtype=np.float32)
+            for idx, dwell_vec in enumerate(self.needle_dwells[: self.max_needles]):
+                start = idx * self.max_path_points
+                if start >= self.dwell_flat_len:
+                    break
+                vec = np.asarray(dwell_vec, dtype=np.float32)
+                if vec.size:
+                    length = min(vec.size, self.max_path_points, self.dwell_flat_len - start)
+                    dwell_flat[start:start + length] = vec[:length]
+            dwell_mean = float(dwell_flat.mean())
+            dwell_max = float(dwell_flat.max())
+            dwell_sum = float(dwell_flat.sum())
+            dwell_ds = dwell_flat[:: self.dwell_ds_stride]
+            if dwell_ds.size < self.dwell_ds_len:
+                pad = np.zeros(self.dwell_ds_len - dwell_ds.size, dtype=np.float32)
+                dwell_ds = np.concatenate([dwell_ds.astype(np.float32), pad])
+            elif dwell_ds.size > self.dwell_ds_len:
+                dwell_ds = dwell_ds[: self.dwell_ds_len]
+        else:
+            dwell_mean = 0.0
+            dwell_max = 0.0
+            dwell_sum = 0.0
+            dwell_ds = np.zeros(0, dtype=np.float32)
+
+        scalars = np.array([
+            hrctv_d90,
+            rectum,
+            bladder,
+            sigmoid,
+            bowel,
+            vagina,
+            frac_needles,
+            coverage_200,
+            coverage_400,
+            coverage_600,
+            self.baseline_d90,
+            self.baseline_d98,
+            dwell_mean,
+            dwell_max,
+            dwell_sum,
+            *dwell_ds,
+        ], dtype=np.float32)
+        slices = self._extract_isodose_slices().reshape(-1)
+        return np.concatenate([scalars, dose_hist, slices]).astype(np.float32)
+
+    # ============================================================
+    # TANDEM → NEEDLE INTEGRATION HELPERS
+    # ============================================================
+    def set_base_dose_map(self, dose_map):
+        """Seed the environment with an external (e.g. tandem) dose map."""
+
+        if dose_map.shape != self.structure_mask.shape:
+            raise ValueError("dose_map shape must match structure_mask")
+        self.base_dose_map = dose_map.astype(np.float32)
+        self.base_dose_scale = 1.0
+        self.tandem_dwell_times = None
+        self.ovoid_dwell_times = None
+
+    def clear_base_dose_map(self):
+        """Remove any previously seeded tandem contribution."""
+
+        self.base_dose_map = None
+        self.base_dose_scale = 1.0
+        self.tandem_dwell_times = None
+        self.ovoid_dwell_times = None
+
+    # ============================================================
+    # TG-43 KERNEL
+    # ============================================================
+    def build_tg43_kernel(self, radius_mm=20.0):
+        spacing = self.voxel_spacing_mm
+        ranges = [int(np.ceil(radius_mm / s)) for s in spacing]
+        offsets = []
+
+        for dz in range(-ranges[0], ranges[0] + 1):
+            for dy in range(-ranges[1], ranges[1] + 1):
+                for dx in range(-ranges[2], ranges[2] + 1):
+                    offset_mm = np.array([
+                        dz * spacing[0],
+                        dy * spacing[1],
+                        dx * spacing[2],
+                    ], dtype=np.float32)
+                    dist = np.linalg.norm(offset_mm)
+                    if dist > radius_mm:
+                        continue
+
+                    r_cm = max(dist / 10.0, 0.05)
+                    # Assume isotropic point-source geometry factor (1/r^2)
+                    dose_rate = tg43.DOSE_RATE_CONSTANT * tg43.radial_g(r_cm) / (r_cm ** 2)
+                    dose_per_second = dose_rate / 3600.0
+
+                    offsets.append((dz, dy, dx, dose_per_second))
+
+        return {
+            "offsets": offsets,
+            "voxel_spacing_mm": spacing,
+            "radius_mm": radius_mm,
+        }
