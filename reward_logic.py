@@ -26,12 +26,14 @@ OAR_CONSTRAINTS = {
 MISS_PENALTY_WEIGHT = 1.0  # Penalty for needles missing HRCTV
 TRAINING_DOSE_SCALE = 10.0  # calibrated boost for kernel mode (if used)
 AIR_KERMA_STRENGTH_U = 40700.0  # default Ir-192 source strength
+
+# Penalty weights based off Duke protocol, as well as Serial/Parallel OAR considerations.
 OAR_PENALTY_WEIGHTS = {
-    "Rectum": 4.0,
-    "Bladder": 8.0,
-    "Sigmoid": 8.0,
-    "Bowel": 4.0,
-    "Vagina": 22.0,
+    "Rectum": 12.0,
+    "Bladder": 12.0,
+    "Sigmoid": 12.0,
+    "Bowel": 12.0,
+    "Vagina": 4.0,
 }
 
 # Hard cap for HRCTV D90 (cGy). Plans above this should be discouraged.
@@ -752,8 +754,9 @@ def compute_reward(
 
 
     # -----------------------------
-    # 2) OAR PENALTY
+    # 2) OAR PENALTIES AND REWARDS
     # -----------------------------
+    # This version used the same penalty OARs and into the OAR rewards.
     oar_penalty = 0.0
     oar_sparing = 0.0
     oar_ok = True
@@ -765,7 +768,7 @@ def compute_reward(
         if limit > 0:
             frac = float(dose) / float(limit)
             if frac < 1.0:
-                oar_sparing += (1.0 - frac)
+                oar_sparing += weight * (1.0 - frac)
             else:
                 oar_over_max = max(oar_over_max, frac - 1.0)
         if dose > limit:
@@ -786,7 +789,7 @@ def compute_reward(
                 oar_penalty += weight * ((over / limit) ** 2)
 
 
-   
+  
 
 
     # -----------------------------
